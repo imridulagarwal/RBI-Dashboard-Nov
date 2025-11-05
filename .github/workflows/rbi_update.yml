@@ -1,0 +1,92 @@
+name: RBI Monthly Update
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '15 2 15 * *'  # runs monthly (2:15 UTC ~ 7:45 IST) – adjust as you like
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # so we can commit JSON to the repo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl
+
+      - name: Install Playwright (headless browser)
+        uses: microsoft/playwright-github-action@v1
+
+      - name: Download latest RBI Excel
+        id: dl
+        run: |
+          python - <<'PY'
+          import re, os, calendar, datetime as dt
+          from playwright.sync_api import sync_playwright
+          os.makedirs('downloads', exist_ok=True)
+          with sync_playwright() as p:
+            browser = p.chromium.launch()
+            ctx = browser.new_context(accept_downloads=True)
+            page = ctx.new_page()
+            page.goto("https://rbi.org.in/Scripts/ATMView.aspx", timeout=120000)
+            # Click the first "Bank-wise ATM/POS/Card Statistics - <Month Year>" link
+            link = page.get_by_role("link", name=re.compile("Bank-wise ATM/POS/Card Statistics", re.I)).first
+            link.click()
+            # Click "Excel" link to download the file
+            with page.expect_download() as dl_info:
+              page.get_by_role("link", name=re.compile("Excel", re.I)).click()
+            d = dl_info.value
+            dest = os.path.join("downloads", d.suggested_filename)
+            d.save_as(dest)
+            # Try to parse year/month from page text
+            txt = page.inner_text("body")
+            m = re.search(r"Month of\s+([A-Za-z]+)\s+(\d{4})", txt) or re.search(r"([A-Za-z]+)\s+(\d{4})", txt)
+            if m:
+              month_name, year = m.group(1).capitalize(), int(m.group(2))
+              month = list(calendar.month_name).index(month_name)
+            else:
+              today = dt.date.today(); first=today.replace(day=1); prev=first-dt.timedelta(days=1)
+              year, month = prev.year, prev.month
+            print(dest, year, month)
+          PY
+
+          # stash path/year/month for next step
+          echo "XLSX_PATH=$(ls downloads/*.XLSX | head -n1)" >> $GITHUB_ENV
+          python - <<'PY'
+          import os, re, calendar, datetime as dt, json
+          x = os.environ['XLSX_PATH']
+          # best-effort parse from filename; fallback to previous month
+          import sys
+          m=re.search(r'ATM([A-Z]+)(\d{4})', os.path.basename(x), re.I)
+          import datetime as D, calendar as C
+          if m:
+            month = list(C.month_name).index(m.group(1).capitalize()); year=int(m.group(2))
+          else:
+            today=D.date.today(); first=today.replace(day=1); prev=first-D.timedelta(days=1); year,month=prev.year,prev.month
+          print(f"::set-output name=year::{year}")
+          print(f"::set-output name=month::{month}")
+          PY
+
+      - name: Emit JSON into docs/data
+        run: |
+          YEAR=${{ steps.dl.outputs.year || '2025' }}
+          MONTH=${{ steps.dl.outputs.month || '9' }}
+          echo "Using YEAR=$YEAR MONTH=$MONTH"
+          python tools/emit_json.py "$XLSX_PATH" "$YEAR" "$MONTH"
+
+      - name: Commit JSON to repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add docs/data/*.json
+          git commit -m "RBI data update" || echo "No changes"
+          git push
