@@ -1,92 +1,86 @@
-name: RBI Monthly Update
-
-on:
-  workflow_dispatch: {}
-  schedule:
-    - cron: '15 2 15 * *'  # monthly; adjust as needed
-
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write  # allow committing JSON back to repo
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas openpyxl playwright
-
-      # Install Playwright browsers + required OS dependencies (fixes your error)
-      - name: Install Playwright browsers and system deps
-        run: |
-          python -m playwright install --with-deps chromium
-
       - name: Download latest RBI Excel (headless Playwright Python)
         id: download
         run: |
           python - <<'PY'
-          import os, re, calendar, datetime as dt
+          import os, calendar, datetime as dt, re
           from pathlib import Path
-          from playwright.sync_api import sync_playwright
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
           DL = Path("downloads"); DL.mkdir(exist_ok=True)
+
+          def pick_year_month_from_text(txt: str):
+              m = re.search(r"Month of\s+([A-Za-z]+)\s+(\d{4})", txt) or re.search(r"([A-Za-z]+)\s+(\d{4})", txt)
+              if m:
+                  month_name, year = m.group(1).capitalize(), int(m.group(2))
+                  month = list(calendar.month_name).index(month_name)
+                  if month == 0:  # failed to map
+                      raise ValueError("Could not map month name")
+                  return year, month
+              # fallback: previous month
+              today = dt.date.today()
+              first = today.replace(day=1)
+              prev = first - dt.timedelta(days=1)
+              return prev.year, prev.month
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
               context = browser.new_context(accept_downloads=True)
               page = context.new_page()
+              page.set_default_timeout(120_000)
+
               page.goto("https://rbi.org.in/Scripts/ATMView.aspx", timeout=120000)
+              page.wait_for_load_state("domcontentloaded")
 
-              # Click the first "Bank-wise ATM/POS/Card Statistics - <Month Year>" link
-              link = page.get_by_role("link", name=re.compile("Bank-wise ATM/POS/Card Statistics", re.I)).first
-              link.click()
+              # ---- Robust link selection (NO regex role selectors) ----
+              # Try text locator first
+              try:
+                  page.locator("a:has-text('Bank-wise ATM/POS/Card Statistics')").first.click()
+              except PWTimeout:
+                  # Fallback: find any anchor that looks like the monthly item
+                  candidates = page.locator("a").all()
+                  clicked = False
+                  for i, a in enumerate(candidates):
+                      try:
+                          t = a.inner_text().strip()
+                      except Exception:
+                          continue
+                      if "Bank-wise ATM/POS/Card Statistics" in t:
+                          a.click()
+                          clicked = True
+                          break
+                  if not clicked:
+                      raise RuntimeError("Could not find the monthly 'Bank-wise ATM/POS/Card Statistics' link")
 
-              # Click the Excel download link
-              with page.expect_download() as dl_info:
-                  page.get_by_role("link", name=re.compile("Excel", re.I)).click()
-              download = dl_info.value
+              # We should now be on the month page
+              page.wait_for_load_state("domcontentloaded")
+
+              # ---- Download Excel: try text('Excel') first; fallback to direct XLSX href ----
+              download = None
+              try:
+                  with page.expect_download() as dl_info:
+                      page.locator("a:has-text('Excel')").first.click()
+                  download = dl_info.value
+              except Exception:
+                  # Fallback: click first .XLSX link
+                  a_xlsx = page.locator("a[href$='.XLSX'], a[href$='.xlsx']").first
+                  with page.expect_download() as dl_info:
+                      a_xlsx.click()
+                  download = dl_info.value
+
               dest = DL / download.suggested_filename
               download.save_as(str(dest))
 
-              # Try to read Month/Year from the page; fallback to previous month
+              # Derive year/month from page text, else fallback
               txt = page.inner_text("body")
-              m = re.search(r"Month of\s+([A-Za-z]+)\s+(\d{4})", txt) or re.search(r"([A-Za-z]+)\s+(\d{4})", txt)
-              if m:
-                  month_name, year = m.group(1).capitalize(), int(m.group(2))
-                  month = list(calendar.month_name).index(month_name)
-              else:
-                  today = dt.date.today(); first = today.replace(day=1); prev = first - dt.timedelta(days=1)
-                  year, month = prev.year, prev.month
+              year, month = pick_year_month_from_text(txt)
 
               print(f"XLSX_PATH={dest}")
               print(f"YEAR={year}")
               print(f"MONTH={month}")
 
-              # Pass values to next steps
-              github_output = os.environ['GITHUB_OUTPUT']
-              with open(github_output,'a') as f:
+              # Pass outputs to next steps
+              with open(os.environ['GITHUB_OUTPUT'],'a') as f:
                   f.write(f"XLSX_PATH={dest}\n")
                   f.write(f"YEAR={year}\n")
                   f.write(f"MONTH={month}\n")
           PY
-
-      - name: Emit JSON into docs/data
-        run: |
-          python tools/emit_json.py "${{ steps.download.outputs.XLSX_PATH }}" "${{ steps.download.outputs.YEAR }}" "${{ steps.download.outputs.MONTH }}"
-
-      - name: Commit JSON
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git add docs/data/*.json
-          git commit -m "RBI data update" || echo "No changes"
-          git push
