@@ -3,7 +3,7 @@ name: RBI Monthly Update
 on:
   workflow_dispatch:
   schedule:
-    - cron: '15 2 15 * *'  # runs monthly; adjust as needed
+    - cron: '15 2 15 * *'  # monthly; adjust as needed
 
 jobs:
   update:
@@ -25,17 +25,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas openpyxl playwright
 
-      # Install Playwright browsers + required OS dependencies
+      # Install Playwright browsers + required OS packages
       - name: Install Playwright browsers and system deps
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Download latest RBI Excel (headless Playwright Python)
+      # Robust download: find Excel href, fetch bytes via page.request (no expect_download)
+      - name: Download latest RBI Excel (robust href fetch)
         id: download
         run: |
           python - <<'PY'
           import os, calendar, datetime as dt, re
           from pathlib import Path
+          from urllib.parse import urljoin, urlparse
           from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
           DL = Path("downloads"); DL.mkdir(exist_ok=True)
@@ -48,6 +50,7 @@ jobs:
                   if month == 0:
                       raise ValueError("Could not map month name")
                   return year, month
+              # fallback: previous month
               today = dt.date.today()
               first = today.replace(day=1)
               prev = first - dt.timedelta(days=1)
@@ -55,21 +58,24 @@ jobs:
 
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
-              context = browser.new_context(accept_downloads=True)
+              context = browser.new_context()
               page = context.new_page()
               page.set_default_timeout(180_000)
 
+              # 1) Index page
               page.goto("https://rbi.org.in/Scripts/ATMView.aspx", timeout=180000)
               page.wait_for_load_state("domcontentloaded")
 
-              # Click the monthly link without regex role selectors
+              # 2) Click monthly item (no regex role selectors)
               try:
                   page.locator("a:has-text('Bank-wise ATM/POS/Card Statistics')").first.click()
               except PWTimeout:
                   clicked = False
-                  for a in page.locator("a").all():
+                  anchors = page.locator("a")
+                  for i in range(anchors.count()):
+                      a = anchors.nth(i)
                       try:
-                          t = a.inner_text().strip()
+                          t = (a.inner_text() or "").strip()
                       except Exception:
                           continue
                       if "Bank-wise ATM/POS/Card Statistics" in t:
@@ -81,20 +87,52 @@ jobs:
 
               page.wait_for_load_state("domcontentloaded")
 
-              # Download Excel (try 'Excel' text; fallback to first .XLSX link)
-              try:
-                  with page.expect_download() as dl_info:
-                      page.locator("a:has-text('Excel')").first.click()
-                  download = dl_info.value
-              except Exception:
-                  a_xlsx = page.locator("a[href$='.XLSX'], a[href$='.xlsx']").first
-                  with page.expect_download() as dl_info:
-                      a_xlsx.click()
-                  download = dl_info.value
+              # 3) Find Excel href
+              excel_href = None
+              els = page.locator("a:has-text('Excel')")
+              if els.count() > 0:
+                  excel_href = els.first.get_attribute("href")
 
-              dest = DL / download.suggested_filename
-              download.save_as(str(dest))
+              if not excel_href:
+                  anchors = page.locator("a[href]")
+                  for i in range(anchors.count()):
+                      href = anchors.nth(i).get_attribute("href") or ""
+                      if href.lower().endswith((".xlsx", ".xls")):
+                          excel_href = href
+                          break
 
+              if not excel_href:
+                  # Very last resort: any link that looks like a download
+                  anchors = page.locator("a[href]")
+                  for i in range(anchors.count()):
+                      href = anchors.nth(i).get_attribute("href") or ""
+                      if "excel" in href.lower() or "download" in href.lower():
+                          excel_href = href
+                          break
+
+              if not excel_href:
+                  raise RuntimeError("Could not locate Excel download link on the month page")
+
+              # 4) Absolute URL + fetch via page.request
+              abs_url = urljoin(page.url, excel_href)
+              resp = page.request.get(abs_url)
+              if not resp.ok:
+                  raise RuntimeError(f"Excel fetch failed: {resp.status} {resp.status_text()}")
+
+              # 5) Filename from headers or URL
+              fname = None
+              cd = resp.headers.get("content-disposition") or resp.headers.get("Content-Disposition")
+              if cd and "filename=" in cd:
+                  fname = cd.split("filename=",1)[1].strip().strip('"').strip("'")
+              if not fname:
+                  fname = os.path.basename(urlparse(abs_url).path) or "rbi_data.xlsx"
+              if not fname.lower().endswith((".xlsx",".xls")):
+                  fname += ".xlsx"
+
+              dest = DL / fname
+              dest.write_bytes(resp.body())
+
+              # 6) Month/year from page
               txt = page.inner_text("body")
               year, month = pick_year_month_from_text(txt)
 
@@ -102,7 +140,7 @@ jobs:
               print(f"YEAR={year}")
               print(f"MONTH={month}")
 
-              # Pass outputs to next steps
+              # Set outputs
               with open(os.environ['GITHUB_OUTPUT'],'a') as f:
                   f.write(f"XLSX_PATH={dest}\n")
                   f.write(f"YEAR={year}\n")
