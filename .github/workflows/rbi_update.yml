@@ -1,3 +1,35 @@
+name: RBI Monthly Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 2 15 * *'  # runs monthly; adjust as needed
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # allow committing JSON back to repo
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl playwright
+
+      # Install Playwright browsers + required OS dependencies
+      - name: Install Playwright browsers and system deps
+        run: |
+          python -m playwright install --with-deps chromium
+
       - name: Download latest RBI Excel (headless Playwright Python)
         id: download
         run: |
@@ -13,10 +45,9 @@
               if m:
                   month_name, year = m.group(1).capitalize(), int(m.group(2))
                   month = list(calendar.month_name).index(month_name)
-                  if month == 0:  # failed to map
+                  if month == 0:
                       raise ValueError("Could not map month name")
                   return year, month
-              # fallback: previous month
               today = dt.date.today()
               first = today.replace(day=1)
               prev = first - dt.timedelta(days=1)
@@ -26,20 +57,17 @@
               browser = p.chromium.launch(headless=True)
               context = browser.new_context(accept_downloads=True)
               page = context.new_page()
-              page.set_default_timeout(120_000)
+              page.set_default_timeout(180_000)
 
-              page.goto("https://rbi.org.in/Scripts/ATMView.aspx", timeout=120000)
+              page.goto("https://rbi.org.in/Scripts/ATMView.aspx", timeout=180000)
               page.wait_for_load_state("domcontentloaded")
 
-              # ---- Robust link selection (NO regex role selectors) ----
-              # Try text locator first
+              # Click the monthly link without regex role selectors
               try:
                   page.locator("a:has-text('Bank-wise ATM/POS/Card Statistics')").first.click()
               except PWTimeout:
-                  # Fallback: find any anchor that looks like the monthly item
-                  candidates = page.locator("a").all()
                   clicked = False
-                  for i, a in enumerate(candidates):
+                  for a in page.locator("a").all():
                       try:
                           t = a.inner_text().strip()
                       except Exception:
@@ -49,19 +77,16 @@
                           clicked = True
                           break
                   if not clicked:
-                      raise RuntimeError("Could not find the monthly 'Bank-wise ATM/POS/Card Statistics' link")
+                      raise RuntimeError("Could not find monthly link")
 
-              # We should now be on the month page
               page.wait_for_load_state("domcontentloaded")
 
-              # ---- Download Excel: try text('Excel') first; fallback to direct XLSX href ----
-              download = None
+              # Download Excel (try 'Excel' text; fallback to first .XLSX link)
               try:
                   with page.expect_download() as dl_info:
                       page.locator("a:has-text('Excel')").first.click()
                   download = dl_info.value
               except Exception:
-                  # Fallback: click first .XLSX link
                   a_xlsx = page.locator("a[href$='.XLSX'], a[href$='.xlsx']").first
                   with page.expect_download() as dl_info:
                       a_xlsx.click()
@@ -70,7 +95,6 @@
               dest = DL / download.suggested_filename
               download.save_as(str(dest))
 
-              # Derive year/month from page text, else fallback
               txt = page.inner_text("body")
               year, month = pick_year_month_from_text(txt)
 
@@ -84,3 +108,15 @@
                   f.write(f"YEAR={year}\n")
                   f.write(f"MONTH={month}\n")
           PY
+
+      - name: Emit JSON into docs/data
+        run: |
+          python tools/emit_json.py "${{ steps.download.outputs.XLSX_PATH }}" "${{ steps.download.outputs.YEAR }}" "${{ steps.download.outputs.MONTH }}"
+
+      - name: Commit JSON
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add docs/data/*.json
+          git commit -m "RBI data update" || echo "No changes"
+          git push
