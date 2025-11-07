@@ -23,7 +23,7 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl playwright
+          pip install pandas openpyxl xlrd lxml playwright
 
       # Install Playwright browsers + required OS packages
       - name: Install Playwright browsers and system deps
