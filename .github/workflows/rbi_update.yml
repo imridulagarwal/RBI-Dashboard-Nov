@@ -3,158 +3,78 @@ name: RBI Monthly Update
 on:
   workflow_dispatch:
   schedule:
-    - cron: '15 2 15 * *'  # monthly; adjust as needed
+    # Runs at 06:00 UTC on the 6th of every month (adjust as you like)
+    - cron: "0 6 6 * *"
+
+permissions:
+  contents: write
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write  # allow committing JSON back to repo
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Python deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl xlrd lxml playwright
+          pip install pandas openpyxl xlrd playwright beautifulsoup4 lxml
 
-      # Install Playwright browsers + required OS packages
-      - name: Install Playwright browsers and system deps
+      - name: Install Playwright (Chromium + deps)
+        shell: bash
         run: |
           python -m playwright install --with-deps chromium
 
-      # Robust download: find Excel href, fetch bytes via page.request (no expect_download)
-      - name: Download latest RBI Excel (robust href fetch)
-        id: download
+      - name: Download ALL monthly Excel files
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, calendar, datetime as dt, re
-          from pathlib import Path
-          from urllib.parse import urljoin, urlparse
-          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+          python tools/download_all.py
 
-          DL = Path("downloads"); DL.mkdir(exist_ok=True)
-
-          def pick_year_month_from_text(txt: str):
-              m = re.search(r"Month of\s+([A-Za-z]+)\s+(\d{4})", txt) or re.search(r"([A-Za-z]+)\s+(\d{4})", txt)
-              if m:
-                  month_name, year = m.group(1).capitalize(), int(m.group(2))
-                  month = list(calendar.month_name).index(month_name)
-                  if month == 0:
-                      raise ValueError("Could not map month name")
-                  return year, month
-              # fallback: previous month
-              today = dt.date.today()
-              first = today.replace(day=1)
-              prev = first - dt.timedelta(days=1)
-              return prev.year, prev.month
-
-          with sync_playwright() as p:
-              browser = p.chromium.launch(headless=True)
-              context = browser.new_context()
-              page = context.new_page()
-              page.set_default_timeout(180_000)
-
-              # 1) Index page
-              page.goto("https://rbi.org.in/Scripts/ATMView.aspx", timeout=180000)
-              page.wait_for_load_state("domcontentloaded")
-
-              # 2) Click monthly item (no regex role selectors)
-              try:
-                  page.locator("a:has-text('Bank-wise ATM/POS/Card Statistics')").first.click()
-              except PWTimeout:
-                  clicked = False
-                  anchors = page.locator("a")
-                  for i in range(anchors.count()):
-                      a = anchors.nth(i)
-                      try:
-                          t = (a.inner_text() or "").strip()
-                      except Exception:
-                          continue
-                      if "Bank-wise ATM/POS/Card Statistics" in t:
-                          a.click()
-                          clicked = True
-                          break
-                  if not clicked:
-                      raise RuntimeError("Could not find monthly link")
-
-              page.wait_for_load_state("domcontentloaded")
-
-              # 3) Find Excel href
-              excel_href = None
-              els = page.locator("a:has-text('Excel')")
-              if els.count() > 0:
-                  excel_href = els.first.get_attribute("href")
-
-              if not excel_href:
-                  anchors = page.locator("a[href]")
-                  for i in range(anchors.count()):
-                      href = anchors.nth(i).get_attribute("href") or ""
-                      if href.lower().endswith((".xlsx", ".xls")):
-                          excel_href = href
-                          break
-
-              if not excel_href:
-                  # Very last resort: any link that looks like a download
-                  anchors = page.locator("a[href]")
-                  for i in range(anchors.count()):
-                      href = anchors.nth(i).get_attribute("href") or ""
-                      if "excel" in href.lower() or "download" in href.lower():
-                          excel_href = href
-                          break
-
-              if not excel_href:
-                  raise RuntimeError("Could not locate Excel download link on the month page")
-
-              # 4) Absolute URL + fetch via page.request
-              abs_url = urljoin(page.url, excel_href)
-              resp = page.request.get(abs_url)
-              if not resp.ok:
-                  raise RuntimeError(f"Excel fetch failed: {resp.status} {resp.status_text()}")
-
-              # 5) Filename from headers or URL
-              fname = None
-              cd = resp.headers.get("content-disposition") or resp.headers.get("Content-Disposition")
-              if cd and "filename=" in cd:
-                  fname = cd.split("filename=",1)[1].strip().strip('"').strip("'")
-              if not fname:
-                  fname = os.path.basename(urlparse(abs_url).path) or "rbi_data.xlsx"
-              if not fname.lower().endswith((".xlsx",".xls")):
-                  fname += ".xlsx"
-
-              dest = DL / fname
-              dest.write_bytes(resp.body())
-
-              # 6) Month/year from page
-              txt = page.inner_text("body")
-              year, month = pick_year_month_from_text(txt)
-
-              print(f"XLSX_PATH={dest}")
-              print(f"YEAR={year}")
-              print(f"MONTH={month}")
-
-              # Set outputs
-              with open(os.environ['GITHUB_OUTPUT'],'a') as f:
-                  f.write(f"XLSX_PATH={dest}\n")
-                  f.write(f"YEAR={year}\n")
-                  f.write(f"MONTH={month}\n")
-          PY
-
-      - name: Emit JSON into docs/data
+      - name: Debug listing before emit
+        shell: bash
         run: |
-          python tools/emit_json.py "${{ steps.download.outputs.XLSX_PATH }}" "${{ steps.download.outputs.YEAR }}" "${{ steps.download.outputs.MONTH }}"
+          echo "Downloads:"
+          ls -lah downloads || true
+          echo "Manifest head:"
+          head -n 20 downloads/manifest.jsonl || true
+          echo "docs/data before emit:"
+          mkdir -p docs/data
+          ls -lah docs/data || true
 
-      - name: Commit JSON
+      - name: Emit JSON for all months present
+        shell: bash
+        run: |
+          python -c "import tools.batch_emit as b; b.main()"
+
+      - name: Debug listing after emit
+        shell: bash
+        run: |
+          echo "docs/data after emit:"
+          ls -lah docs/data || true
+          echo "banks.json:"
+          test -f docs/data/banks.json && wc -c docs/data/banks.json || true
+          echo "index.json:"
+          test -f docs/data/index.json && cat docs/data/index.json || true
+
+      - name: Commit JSON (safe if nothing to commit)
+        shell: bash
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add docs/data/*.json
-          git commit -m "RBI data update" || echo "No changes"
+          git add -A docs/data
+          if git diff --cached --quiet; then
+            echo "No JSON generated this run (nothing to commit)."
+            exit 0
+          fi
+          git commit -m "RBI data update (multi-month)"
           git push
